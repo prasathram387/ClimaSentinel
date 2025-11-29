@@ -21,7 +21,7 @@ logger = structlog.get_logger()
 def geocode_location(location: str) -> Optional[Dict[str, float]]:
     """
     Geocode a location (area, city, village) to get coordinates.
-    Uses OpenWeatherMap Geocoding API.
+    Uses OpenWeatherMap Geocoding API with improved accuracy.
     
     Args:
         location: Location string (e.g., "Ashok Nagar, Chennai" or "Seruvamani, Thiruvarur")
@@ -35,23 +35,44 @@ def geocode_location(location: str) -> Optional[Dict[str, float]]:
         return None
     
     try:
-        url = f"http://api.openweathermap.org/geo/1.0/direct?q={location}&limit=1&appid={api_key}"
+        # Improve location specificity by adding India if not present
+        query_location = location
+        if "india" not in location.lower() and "," not in location:
+            # If it's just a city name, add ", India" for better accuracy
+            query_location = f"{location}, India"
+        
+        url = f"http://api.openweathermap.org/geo/1.0/direct?q={query_location}&limit=5&appid={api_key}"
         response = requests.get(url, timeout=10)
         
         if response.status_code == 200:
             data = response.json()
             if data and len(data) > 0:
+                # Try to find best match (prefer Indian locations)
+                best_match = None
+                for item in data:
+                    if item.get("country") == "IN":
+                        best_match = item
+                        break
+                
+                # If no Indian location found, use first result
+                if not best_match:
+                    best_match = data[0]
+                
                 result = {
-                    "lat": data[0].get("lat"),
-                    "lon": data[0].get("lon"),
-                    "name": data[0].get("name", location),
-                    "country": data[0].get("country", ""),
-                    "state": data[0].get("state", "")
+                    "lat": best_match.get("lat"),
+                    "lon": best_match.get("lon"),
+                    "name": best_match.get("name", location),
+                    "country": best_match.get("country", ""),
+                    "state": best_match.get("state", "")
                 }
-                logger.info("geocoding.success", location=location, lat=result["lat"], lon=result["lon"])
+                logger.info("geocoding.success", 
+                           original_location=location,
+                           resolved_location=f"{result['name']}, {result['state']}, {result['country']}",
+                           lat=result["lat"], 
+                           lon=result["lon"])
                 return result
             else:
-                logger.warning("geocoding.no_results", location=location)
+                logger.warning("geocoding.no_results", location=location, query=query_location)
                 return None
         else:
             logger.error("geocoding.error", location=location, status=response.status_code)
@@ -529,6 +550,190 @@ def get_social_media_reports(location: str, context: str = "", date: Optional[st
         current_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
     return f"Social Media Reports for {location} (Collected on: {current_date}):\n" + "\n".join(reports)
+
+
+def fact_check_weather_claim(user_claim: str, official_weather: Any, location: str) -> Dict[str, Any]:
+    """
+    Fact-check a weather claim against official weather data.
+    
+    Args:
+        user_claim: User's weather claim/report
+        official_weather: Official weather data from API
+        location: Location being checked
+        
+    Returns:
+        Dictionary with verification results
+    """
+    import re
+    
+    # Extract official weather metrics
+    if isinstance(official_weather, dict):
+        official_temp = official_weather.get("temperature", 0)
+        official_condition = official_weather.get("condition", "").lower()
+        official_wind = official_weather.get("wind_speed", 0)
+        official_humidity = official_weather.get("humidity", 0)
+    else:
+        # Parse from string
+        official_str = str(official_weather).lower()
+        temp_match = re.search(r"temperature[:\s]*([\d.]+)", official_str, re.IGNORECASE)
+        official_temp = float(temp_match.group(1)) if temp_match else 0
+        official_condition = official_str
+        wind_match = re.search(r"wind[\s_]speed[:\s]*([\d.]+)", official_str, re.IGNORECASE)
+        official_wind = float(wind_match.group(1)) if wind_match else 0
+        humid_match = re.search(r"humidity[:\s]*([\d.]+)", official_str, re.IGNORECASE)
+        official_humidity = float(humid_match.group(1)) if humid_match else 0
+    
+    user_claim_lower = user_claim.lower()
+    discrepancies = []
+    matches = []
+    verdict = "VERIFIED"
+    confidence = 100
+    
+    # Check for impossible/rare weather events
+    # Tsunamis, earthquakes, volcanic eruptions are NOT weather events
+    if any(word in user_claim_lower for word in ["tsunami", "tidal wave"]):
+        discrepancies.append("✗ Tsunami is NOT a weather event - it's caused by earthquakes/underwater seismic activity")
+        discrepancies.append("✗ Weather APIs cannot detect tsunamis - check seismic monitoring systems")
+        verdict = "CANNOT VERIFY - NOT A WEATHER EVENT"
+        confidence = 0
+        return {
+            "verdict": verdict,
+            "confidence": confidence,
+            "matches": matches,
+            "discrepancies": discrepancies,
+            "official_summary": f"Weather data: {official_condition.title()}, {official_temp}°C (Tsunami detection requires seismic monitoring, not weather data)"
+        }
+    
+    if any(word in user_claim_lower for word in ["earthquake", "tremor", "seismic"]):
+        discrepancies.append("✗ Earthquakes are NOT weather events - they are geological/seismic events")
+        discrepancies.append("✗ Weather APIs cannot detect earthquakes - check seismograph data")
+        verdict = "CANNOT VERIFY - NOT A WEATHER EVENT"
+        confidence = 0
+        return {
+            "verdict": verdict,
+            "confidence": confidence,
+            "matches": matches,
+            "discrepancies": discrepancies,
+            "official_summary": f"Weather data: {official_condition.title()}, {official_temp}°C (Earthquake detection requires seismographs, not weather data)"
+        }
+    
+    if any(word in user_claim_lower for word in ["volcano", "volcanic", "eruption", "lava"]):
+        discrepancies.append("✗ Volcanic activity is NOT a weather event - it's a geological event")
+        verdict = "CANNOT VERIFY - NOT A WEATHER EVENT"
+        confidence = 0
+        return {
+            "verdict": verdict,
+            "confidence": confidence,
+            "matches": matches,
+            "discrepancies": discrepancies,
+            "official_summary": f"Weather data: {official_condition.title()}, {official_temp}°C (Volcanic activity monitoring requires geological sensors)"
+        }
+    
+    # Check for extremely rare events in certain regions
+    if any(word in user_claim_lower for word in ["tornado", "twister"]) and "india" in location.lower():
+        discrepancies.append("✗ Tornadoes are extremely rare in India (< 5 per year)")
+        discrepancies.append("ℹ️ Official weather shows no severe rotating storms")
+        verdict = "HIGHLY UNLIKELY"
+        confidence = 5
+    
+    # Check temperature claims
+    if any(word in user_claim_lower for word in ["hot", "heat", "warm", "cold", "cool", "freezing"]):
+        if "hot" in user_claim_lower or "heat" in user_claim_lower:
+            if official_temp > 35:
+                matches.append(f"✓ Hot weather confirmed: {official_temp}°C")
+            elif official_temp < 30:
+                discrepancies.append(f"✗ Claim says 'hot' but temperature is only {official_temp}°C (moderate)")
+                verdict = "PARTIALLY FALSE"
+                confidence = 40
+        
+        if "cold" in user_claim_lower or "freezing" in user_claim_lower or "cool" in user_claim_lower:
+            if official_temp < 15:
+                matches.append(f"✓ Cold weather confirmed: {official_temp}°C")
+            elif official_temp > 25:
+                discrepancies.append(f"✗ Claim says 'cold' but temperature is {official_temp}°C (warm)")
+                verdict = "FALSE"
+                confidence = 20
+    
+    # Check rain/precipitation claims
+    if any(word in user_claim_lower for word in ["rain", "drizzle", "shower", "downpour", "wet"]):
+        if any(word in official_condition for word in ["rain", "drizzle", "shower", "precipitation"]):
+            if "heavy" in user_claim_lower and "heavy" in official_condition:
+                matches.append("✓ Heavy rain confirmed")
+            elif "light" in user_claim_lower and "light" in official_condition:
+                matches.append("✓ Light rain confirmed")
+            else:
+                matches.append(f"✓ Rain confirmed: {official_condition}")
+        else:
+            if "clear" in official_condition or "sun" in official_condition:
+                discrepancies.append(f"✗ Claim mentions rain but weather is clear/sunny")
+                verdict = "FALSE"
+                confidence = 10
+            else:
+                discrepancies.append(f"✗ No rain detected in official data: {official_condition}")
+                verdict = "UNVERIFIED"
+                confidence = 50
+    
+    # Check storm/thunderstorm claims
+    if any(word in user_claim_lower for word in ["storm", "thunder", "lightning"]):
+        if "thunder" in official_condition or "storm" in official_condition:
+            matches.append(f"✓ Storm/thunderstorm confirmed")
+        elif official_wind > 40:
+            matches.append(f"✓ Strong winds detected: {official_wind} km/h (storm-like conditions)")
+        else:
+            discrepancies.append(f"✗ Claim mentions storm but no severe weather detected")
+            verdict = "PARTIALLY FALSE"
+            confidence = 30
+    
+    # Check wind claims
+    if any(word in user_claim_lower for word in ["wind", "windy", "breeze", "gust"]):
+        if "strong" in user_claim_lower or "heavy" in user_claim_lower:
+            if official_wind > 30:
+                matches.append(f"✓ Strong winds confirmed: {official_wind} km/h")
+            else:
+                discrepancies.append(f"✗ Claim says 'strong winds' but wind speed is only {official_wind} km/h (moderate)")
+                verdict = "PARTIALLY FALSE"
+                confidence = 40
+        elif official_wind > 20:
+            matches.append(f"✓ Windy conditions confirmed: {official_wind} km/h")
+    
+    # Check clear/sunny claims
+    if any(word in user_claim_lower for word in ["clear", "sunny", "sun", "bright"]):
+        if "clear" in official_condition or "sun" in official_condition:
+            matches.append("✓ Clear/sunny weather confirmed")
+        elif "cloud" in official_condition:
+            discrepancies.append(f"✗ Claim says sunny but weather is cloudy: {official_condition}")
+            verdict = "PARTIALLY FALSE"
+            confidence = 50
+    
+    # Check cloud claims
+    if any(word in user_claim_lower for word in ["cloud", "overcast", "grey", "gray"]):
+        if "cloud" in official_condition or "overcast" in official_condition:
+            matches.append(f"✓ Cloudy conditions confirmed: {official_condition}")
+    
+    # Default if no specific claims found
+    if not matches and not discrepancies:
+        matches.append(f"ℹ️ Official weather: {official_condition}, {official_temp}°C")
+        verdict = "NO SPECIFIC CLAIMS TO VERIFY"
+        confidence = 50
+    
+    # Adjust verdict based on matches vs discrepancies
+    if discrepancies and not matches:
+        verdict = "FALSE"
+        confidence = 20
+    elif matches and not discrepancies:
+        verdict = "VERIFIED"
+        confidence = 95
+    elif matches and discrepancies:
+        verdict = "PARTIALLY TRUE"
+        confidence = 60
+    
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "matches": matches,
+        "discrepancies": discrepancies,
+        "official_summary": f"{official_condition.title()}, {official_temp}°C, Wind: {official_wind} km/h, Humidity: {official_humidity}%"
+    }
 
 
 def analyze_disaster_type(weather_data: Any, social_reports: str) -> str:
